@@ -1,10 +1,10 @@
 //! Логіка umod-token-proxy: перевірка, старт, зупинка.
 
+use std::io::{Write, BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
 
 const PROXY_KEY_PLACEHOLDER: &str = "local-proxy-injects-real-auth";
 
@@ -24,28 +24,39 @@ impl ProxyState {
     /// Перевіряє чи проксі слухає на порту.
     /// HTTP-проба /v1/models: 401/403 доводить, що слухає саме проксі,
     /// а не чужий процес. TCP-connect недостатній.
+    /// Прямий HTTP-запит через TcpStream — без PowerShell, без блимання вікон.
     pub fn is_listening(&self) -> bool {
         let addr = format!("127.0.0.1:{}", self.port);
-        if TcpStream::connect_timeout(
-            &addr.parse().unwrap(),
+        let socket_addr = match addr.parse() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let mut stream = match TcpStream::connect_timeout(
+            &socket_addr,
             Duration::from_millis(500),
-        ).is_err() {
+        ) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        // Прямий HTTP-запит — один рядок у сокет
+        let request = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer probe\r\nConnection: close\r\n\r\n",
+            self.port
+        );
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        if stream.write_all(request.as_bytes()).is_err() {
             return false;
         }
-        // HTTP-проба: 401/403 = проксі живий, 200 = теж живий
-        let url = format!("http://127.0.0.1:{}/v1/models", self.port);
-        let cmd = format!(
-            "try {{ $r = Invoke-WebRequest -Uri '{}' -TimeoutSec 2 -UseBasicParsing -Headers @{{Authorization='Bearer probe'}}; Write-Output 'OK' }} catch {{ if ($_.Exception.Response) {{ Write-Output 'OK' }} else {{ Write-Output 'FAIL' }} }}",
-            url
-        );
-        if let Ok(output) = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &cmd])
-            .output()
-        {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return s == "OK";
+        // Читаємо перший рядок відповіді: "HTTP/1.1 200 ..." або "HTTP/1.1 401 ..."
+        let mut reader = BufReader::new(&mut stream);
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line).is_err() {
+            return false;
         }
-        false
+        // Будь-який HTTP-статус = щось слухає і відповідає HTTP
+        // 200/401/403 = проксі; інше — теж проксі, але можлива помилка
+        first_line.starts_with("HTTP/")
     }
 
     /// Шукає credential-файл у стандартних місцях.
@@ -177,6 +188,14 @@ impl ProxyState {
            .stdin(Stdio::null())
            .stdout(Stdio::from(stdout))
            .stderr(Stdio::from(stderr));
+
+        // CREATE_NO_WINDOW — не показувати консольне вікно
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let child = cmd.spawn()
             .map_err(|e| format!("Не вдалося запустити проксі: {}", e))?;

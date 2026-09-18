@@ -17,6 +17,14 @@ const MODELS: &[&str] = &[
     "deepseek-v4.1-flash",
 ];
 
+/// Порт проксі: змінна середовища або 8787 за замовчуванням.
+fn proxy_port() -> u16 {
+    std::env::var("UMOD_PROXY_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8787)
+}
+
 /// Повідомлення з фонового потоку в GUI.
 #[derive(Clone)]
 enum ProxyMsg {
@@ -60,8 +68,8 @@ struct App {
     log: Vec<LogEntry>,
     proxy_running: bool,
     busy: bool,
-    /// Handle проксі — дозволяє зупинити.
     proxy_handle: Arc<Mutex<Option<proxy::ProxyState>>>,
+    port: u16,
     rx: mpsc::Receiver<ProxyMsg>,
     tx: mpsc::Sender<ProxyMsg>,
 }
@@ -71,6 +79,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (cred, warning) = proxy::ProxyState::find_credential();
         let cred_str = cred.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let port = proxy_port();
         Self {
             model: MODELS[0].to_string(),
             cred_path: cred_str,
@@ -83,6 +92,7 @@ impl App {
             proxy_running: false,
             busy: false,
             proxy_handle: Arc::new(Mutex::new(None)),
+            port,
             rx,
             tx,
         }
@@ -131,10 +141,10 @@ impl App {
         let tx = self.tx.clone();
         let handle = self.proxy_handle.clone();
         let cred = self.cred_path.clone();
+        let port = self.port;
         self.add_log("Запускаю проксі...", LogLevel::Info);
 
         std::thread::spawn(move || {
-            let port: u16 = 8787;
             let mut state = proxy::ProxyState::new(port);
             if !cred.is_empty() {
                 state.cred_path = Some(std::path::PathBuf::from(&cred));
@@ -148,11 +158,9 @@ impl App {
             match state.start() {
                 Ok(()) => {
                     let _ = tx.send(ProxyMsg::Started(port));
-                    // Зберігаємо handle у Arc<Mutex> — НЕ forget
                     if let Ok(mut guard) = handle.lock() {
                         *guard = Some(state);
                     } else {
-                        // Не вдалося зберегти — зупиняємо
                         let _ = state.stop();
                         let _ = tx.send(ProxyMsg::Failed("Не вдалося зберегти handle проксі".to_string()));
                     }
@@ -189,8 +197,7 @@ impl App {
 
     fn launch_codex(&mut self) {
         if self.busy { return; }
-        let port: u16 = 8787;
-        let state = proxy::ProxyState::new(port);
+        let state = proxy::ProxyState::new(self.port);
         if !state.is_listening() {
             self.add_log("Проксі не працює — запускаю спочатку", LogLevel::Warn);
             self.start_proxy_bg();
@@ -217,7 +224,6 @@ impl eframe::App for App {
         ui.heading("UMOD Codex");
         ui.add_space(8.0);
 
-        // Модель
         ui.horizontal(|ui| {
             ui.label("Модель:");
             egui::ComboBox::from_id_salt("model_combo")
@@ -229,7 +235,6 @@ impl eframe::App for App {
                 });
         });
 
-        // Credential
         ui.horizontal(|ui| {
             ui.label("Credential:");
             ui.text_edit_singleline(&mut self.cred_path);
@@ -241,7 +246,6 @@ impl eframe::App for App {
             }
         });
 
-        // Warning про credential
         if let Some(w) = &self.cred_warning {
             ui.horizontal(|ui| {
                 ui.colored_label(egui::Color32::from_rgb(220, 180, 60), "⚠");
@@ -251,12 +255,11 @@ impl eframe::App for App {
 
         ui.add_space(8.0);
 
-        // Статус проксі
         ui.horizontal(|ui| {
             let (dot, text) = if self.busy {
                 (egui::Color32::from_rgb(220, 180, 60), "запускається...".to_string())
             } else if self.proxy_running {
-                (egui::Color32::from_rgb(100, 200, 100), "працює на 127.0.0.1:8787".to_string())
+                (egui::Color32::from_rgb(100, 200, 100), format!("працює на 127.0.0.1:{}", self.port))
             } else {
                 (egui::Color32::from_rgb(200, 80, 80), "не працює".to_string())
             };
@@ -266,7 +269,6 @@ impl eframe::App for App {
 
         ui.add_space(8.0);
 
-        // Кнопки
         ui.horizontal(|ui| {
             if ui.add_sized([140.0, 32.0], egui::Button::new("▶ Запустити Codex")).clicked() {
                 self.launch_codex();
@@ -296,12 +298,40 @@ impl eframe::App for App {
     }
 }
 
+/// Локальний час у форматі HH:MM:SS.
+/// Використовує GetLocalTime на Windows (без додаткових залежностей),
+/// fallback на UTC+3 на інших платформах.
+#[cfg(target_os = "windows")]
+fn now_str() -> String {
+    use std::mem::MaybeUninit;
+    #[repr(C)]
+    struct SystemTime {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+    extern "system" {
+        fn GetLocalTime(lpSystemTime: *mut SystemTime);
+    }
+    unsafe {
+        let mut st = MaybeUninit::<SystemTime>::zeroed();
+        GetLocalTime(st.as_mut_ptr());
+        let st = st.assume_init();
+        format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn now_str() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    // Локальний час: UTC + 3 (Europe/Kiev)
     let h = ((secs / 3600) + 3) % 24;
     let m = (secs / 60) % 60;
     let s = secs % 60;
@@ -310,17 +340,19 @@ fn now_str() -> String {
 
 #[cfg(target_os = "windows")]
 fn rfd_file_dialog() -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let script = "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'Credential files (*.env)|*.env|All files (*.*)|*.*'; $f.InitialDirectory = $env:USERPROFILE + '\\.umod'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }";
-    if let Ok(output) = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-    {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(std::path::PathBuf::from(s));
+    let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", script]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = cmd.output() {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(std::path::PathBuf::from(s));
+                }
             }
-        }
     }
     None
 }
@@ -344,3 +376,4 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
 }
+

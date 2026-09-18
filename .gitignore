@@ -3,7 +3,6 @@ vendor/
 
 # Cargo
 target/
-Cargo.lock
 
 # Скрипти завантаження (у TEMP, не в репо)
 fetch.log
