@@ -14,3 +14,9 @@ vendor2.ps1
 fix-vendor.ps1
 fix2.ps1
 fetch_dep.ps1
+
+# Credentials
+*.env
+.env
+.env.*
+**/.umod/
