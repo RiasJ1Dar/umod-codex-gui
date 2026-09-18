@@ -1,10 +1,10 @@
 //! Логіка umod-token-proxy: перевірка, старт, зупинка.
 
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use std::io::{Read, Write};
+
 
 const DEFAULT_PORT: u16 = 8787;
 const PROXY_KEY_PLACEHOLDER: &str = "local-proxy-injects-real-auth";
@@ -192,3 +192,4 @@ impl Drop for ProxyState {
         let _ = self.stop();
     }
 }
+
