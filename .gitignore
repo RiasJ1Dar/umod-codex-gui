@@ -1,0 +1,16 @@
+# Vendor крейти (959 тек, ~100МБ — качаються скриптом)
+vendor/
+
+# Cargo
+target/
+Cargo.lock
+
+# Скрипти завантаження (у TEMP, не в репо)
+fetch.log
+*.py
+
+# Тимчасові скрипти
+vendor2.ps1
+fix-vendor.ps1
+fix2.ps1
+fetch_dep.ps1
