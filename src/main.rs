@@ -1,10 +1,12 @@
 //! UMOD Codex GUI — лаунчер для запуску Codex CLI з профілем umod.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod codex;
 mod proxy;
 
 use eframe::egui;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 const MODELS: &[&str] = &[
     "glm-5.2",
@@ -14,6 +16,16 @@ const MODELS: &[&str] = &[
     "gpt-6-astra",
     "deepseek-v4.1-flash",
 ];
+
+/// Повідомлення з фонового потоку в GUI.
+#[derive(Clone)]
+enum ProxyMsg {
+    Started(u16),
+    AlreadyRunning(u16),
+    Stopped,
+    Failed(String),
+    Log(String),
+}
 
 #[derive(Clone)]
 struct LogEntry {
@@ -43,27 +55,26 @@ impl LogLevel {
 
 struct App {
     model: String,
-    port: String,
     cred_path: String,
+    cred_warning: Option<String>,
     log: Vec<LogEntry>,
     proxy_running: bool,
     busy: bool,
-    rx: mpsc::Receiver<LogEntry>,
-    tx: mpsc::Sender<LogEntry>,
+    /// Handle проксі — дозволяє зупинити.
+    proxy_handle: Arc<Mutex<Option<proxy::ProxyState>>>,
+    rx: mpsc::Receiver<ProxyMsg>,
+    tx: mpsc::Sender<ProxyMsg>,
 }
 
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        let cred = proxy::ProxyState::find_credential()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let port = std::env::var("UMOD_PROXY_PORT")
-            .unwrap_or_else(|_| "8787".to_string());
+        let (cred, warning) = proxy::ProxyState::find_credential();
+        let cred_str = cred.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         Self {
             model: MODELS[0].to_string(),
-            port,
-            cred_path: cred,
+            cred_path: cred_str,
+            cred_warning: warning,
             log: vec![LogEntry {
                 time: now_str(),
                 msg: "UMOD Codex GUI готовий".to_string(),
@@ -71,6 +82,7 @@ impl App {
             }],
             proxy_running: false,
             busy: false,
+            proxy_handle: Arc::new(Mutex::new(None)),
             rx,
             tx,
         }
@@ -85,15 +97,31 @@ impl App {
     }
 
     fn poll_log(&mut self) {
-        while let Ok(entry) = self.rx.try_recv() {
-            if entry.msg.contains("проксі запущено") || entry.msg.contains("працює") {
-                self.proxy_running = true;
-                self.busy = false;
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                ProxyMsg::Started(port) => {
+                    self.proxy_running = true;
+                    self.busy = false;
+                    self.add_log(&format!("Проксі запущено на 127.0.0.1:{}", port), LogLevel::Ok);
+                }
+                ProxyMsg::AlreadyRunning(port) => {
+                    self.proxy_running = true;
+                    self.busy = false;
+                    self.add_log(&format!("Проксі вже працює на 127.0.0.1:{}", port), LogLevel::Ok);
+                }
+                ProxyMsg::Stopped => {
+                    self.proxy_running = false;
+                    self.busy = false;
+                    self.add_log("Проксі зупинено", LogLevel::Info);
+                }
+                ProxyMsg::Failed(e) => {
+                    self.busy = false;
+                    self.add_log(&format!("Помилка: {}", e), LogLevel::Error);
+                }
+                ProxyMsg::Log(msg) => {
+                    self.add_log(&msg, LogLevel::Info);
+                }
             }
-            if entry.level == LogLevel::Error {
-                self.busy = false;
-            }
-            self.log.push(entry);
         }
     }
 
@@ -101,45 +129,67 @@ impl App {
         if self.busy { return; }
         self.busy = true;
         let tx = self.tx.clone();
-        let port: u16 = self.port.parse().unwrap_or(8787);
+        let handle = self.proxy_handle.clone();
         let cred = self.cred_path.clone();
         self.add_log("Запускаю проксі...", LogLevel::Info);
+
         std::thread::spawn(move || {
+            let port: u16 = 8787;
             let mut state = proxy::ProxyState::new(port);
             if !cred.is_empty() {
                 state.cred_path = Some(std::path::PathBuf::from(&cred));
             }
+
             if state.is_listening() {
-                let _ = tx.send(LogEntry {
-                    time: now_str(),
-                    msg: format!("Проксі вже працює на 127.0.0.1:{}", port),
-                    level: LogLevel::Ok,
-                });
+                let _ = tx.send(ProxyMsg::AlreadyRunning(port));
                 return;
             }
+
             match state.start() {
                 Ok(()) => {
-                    let _ = tx.send(LogEntry {
-                        time: now_str(),
-                        msg: format!("Проксі запущено на 127.0.0.1:{}", port),
-                        level: LogLevel::Ok,
-                    });
-                    std::mem::forget(state);
+                    let _ = tx.send(ProxyMsg::Started(port));
+                    // Зберігаємо handle у Arc<Mutex> — НЕ forget
+                    if let Ok(mut guard) = handle.lock() {
+                        *guard = Some(state);
+                    } else {
+                        // Не вдалося зберегти — зупиняємо
+                        let _ = state.stop();
+                        let _ = tx.send(ProxyMsg::Failed("Не вдалося зберегти handle проксі".to_string()));
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(LogEntry {
-                        time: now_str(),
-                        msg: format!("Помилка: {}", e),
-                        level: LogLevel::Error,
-                    });
+                    let _ = tx.send(ProxyMsg::Failed(e));
                 }
+            }
+        });
+    }
+
+    fn stop_proxy(&mut self) {
+        if self.busy { return; }
+        let tx = self.tx.clone();
+        let handle = self.proxy_handle.clone();
+        self.busy = true;
+        self.add_log("Зупиняю проксі...", LogLevel::Info);
+
+        std::thread::spawn(move || {
+            if let Ok(mut guard) = handle.lock() {
+                if let Some(mut state) = guard.take() {
+                    match state.stop() {
+                        Ok(()) => { let _ = tx.send(ProxyMsg::Stopped); }
+                        Err(e) => { let _ = tx.send(ProxyMsg::Failed(e)); }
+                    }
+                } else {
+                    let _ = tx.send(ProxyMsg::Log("Проксі не було запущено".to_string()));
+                }
+            } else {
+                let _ = tx.send(ProxyMsg::Failed("Не вдалося отримати доступ до handle".to_string()));
             }
         });
     }
 
     fn launch_codex(&mut self) {
         if self.busy { return; }
-        let port: u16 = self.port.parse().unwrap_or(8787);
+        let port: u16 = 8787;
         let state = proxy::ProxyState::new(port);
         if !state.is_listening() {
             self.add_log("Проксі не працює — запускаю спочатку", LogLevel::Warn);
@@ -148,7 +198,7 @@ impl App {
         }
         let model = self.model.clone();
         self.add_log(&format!("Запускаю Codex з моделлю {}...", model), LogLevel::Info);
-        match codex::launch(&model, port) {
+        match codex::launch(&model) {
             Ok(()) => {
                 self.add_log(&format!("Codex запущено (модель: {})", model), LogLevel::Ok);
             }
@@ -167,6 +217,7 @@ impl eframe::App for App {
         ui.heading("UMOD Codex");
         ui.add_space(8.0);
 
+        // Модель
         ui.horizontal(|ui| {
             ui.label("Модель:");
             egui::ComboBox::from_id_salt("model_combo")
@@ -178,28 +229,34 @@ impl eframe::App for App {
                 });
         });
 
+        // Credential
         ui.horizontal(|ui| {
             ui.label("Credential:");
             ui.text_edit_singleline(&mut self.cred_path);
             if ui.button("Огляд...").clicked() {
                 if let Some(path) = rfd_file_dialog() {
                     self.cred_path = path.display().to_string();
+                    self.cred_warning = None;
                 }
             }
         });
 
-        ui.horizontal(|ui| {
-            ui.label("Порт проксі:");
-            ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
-        });
+        // Warning про credential
+        if let Some(w) = &self.cred_warning {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(220, 180, 60), "⚠");
+                ui.label(egui::RichText::new(w).small().color(egui::Color32::from_rgb(220, 180, 60)));
+            });
+        }
 
         ui.add_space(8.0);
 
+        // Статус проксі
         ui.horizontal(|ui| {
             let (dot, text) = if self.busy {
                 (egui::Color32::from_rgb(220, 180, 60), "запускається...".to_string())
             } else if self.proxy_running {
-                (egui::Color32::from_rgb(100, 200, 100), format!("працює на 127.0.0.1:{}", self.port))
+                (egui::Color32::from_rgb(100, 200, 100), "працює на 127.0.0.1:8787".to_string())
             } else {
                 (egui::Color32::from_rgb(200, 80, 80), "не працює".to_string())
             };
@@ -209,12 +266,16 @@ impl eframe::App for App {
 
         ui.add_space(8.0);
 
+        // Кнопки
         ui.horizontal(|ui| {
             if ui.add_sized([140.0, 32.0], egui::Button::new("▶ Запустити Codex")).clicked() {
                 self.launch_codex();
             }
-            if ui.add_sized([140.0, 32.0], egui::Button::new("⟳ Пуск проксі")).clicked() {
+            if ui.add_sized([100.0, 32.0], egui::Button::new("⟳ Пуск")).clicked() {
                 self.start_proxy_bg();
+            }
+            if ui.add_sized([100.0, 32.0], egui::Button::new("■ Стоп")).clicked() {
+                self.stop_proxy();
             }
         });
 
@@ -223,6 +284,7 @@ impl eframe::App for App {
         ui.label("Журнал:");
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
+            .stick_to_bottom(true)
             .show(ui, |ui| {
                 for entry in &self.log {
                     ui.horizontal(|ui| {
@@ -239,7 +301,8 @@ fn now_str() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let h = (secs / 3600) % 24;
+    // Локальний час: UTC + 3 (Europe/Kiev)
+    let h = ((secs / 3600) + 3) % 24;
     let m = (secs / 60) % 60;
     let s = secs % 60;
     format!("{:02}:{:02}:{:02}", h, m, s)

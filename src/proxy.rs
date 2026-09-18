@@ -6,7 +6,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 
-const DEFAULT_PORT: u16 = 8787;
 const PROXY_KEY_PLACEHOLDER: &str = "local-proxy-injects-real-auth";
 
 /// Стан проксі-сервера.
@@ -22,39 +21,58 @@ impl ProxyState {
         Self { port, child: None, cred_path: None }
     }
 
-    /// Перевіряє чи проксі вже слухає на порту.
-    /// 401/403 теж означає що слухає — нам треба лише з'єднання.
+    /// Перевіряє чи проксі слухає на порту.
+    /// HTTP-проба /v1/models: 401/403 доводить, що слухає саме проксі,
+    /// а не чужий процес. TCP-connect недостатній.
     pub fn is_listening(&self) -> bool {
         let addr = format!("127.0.0.1:{}", self.port);
-        TcpStream::connect_timeout(
+        if TcpStream::connect_timeout(
             &addr.parse().unwrap(),
             Duration::from_millis(500),
-        ).is_ok()
+        ).is_err() {
+            return false;
+        }
+        // HTTP-проба: 401/403 = проксі живий, 200 = теж живий
+        let url = format!("http://127.0.0.1:{}/v1/models", self.port);
+        let cmd = format!(
+            "try {{ $r = Invoke-WebRequest -Uri '{}' -TimeoutSec 2 -UseBasicParsing -Headers @{{Authorization='Bearer probe'}}; Write-Output 'OK' }} catch {{ if ($_.Exception.Response) {{ Write-Output 'OK' }} else {{ Write-Output 'FAIL' }} }}",
+            url
+        );
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &cmd])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return s == "OK";
+        }
+        false
     }
 
     /// Шукає credential-файл у стандартних місцях.
-    /// Порядок (як у umod-token-proxy):
     ///   1. $UMOD_CRED
     ///   2. ~/.umod/credential.env
-    ///   3. ~/.umod/*.env (будь-який один)
-    pub fn find_credential() -> Option<PathBuf> {
+    ///   3. ~/.umod/*.env (якщо рівно один)
+    /// Повертає (path, warning) — warning якщо файлів >1
+    pub fn find_credential() -> (Option<PathBuf>, Option<String>) {
         if let Ok(p) = std::env::var("UMOD_CRED") {
             let pb = PathBuf::from(&p);
             if pb.is_file() {
-                return Some(pb);
+                return (Some(pb), None);
             }
         }
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .ok()?;
+        let home = match std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME")) {
+            Ok(h) => h,
+            Err(_) => return (None, Some("Не знайшов HOME".to_string())),
+        };
         let umod_dir = PathBuf::from(&home).join(".umod");
         let neutral = umod_dir.join("credential.env");
         if neutral.is_file() {
-            return Some(neutral);
+            return (Some(neutral), None);
         }
         if umod_dir.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&umod_dir) {
-                let mut envs: Vec<_> = entries
+                let envs: Vec<_> = entries
                     .filter_map(|e| e.ok())
                     .filter(|e| {
                         e.path().extension().and_then(|x| x.to_str()) == Some("env")
@@ -62,17 +80,23 @@ impl ProxyState {
                     .map(|e| e.path())
                     .collect();
                 if envs.len() == 1 {
-                    return Some(envs.pop().unwrap());
+                    return (Some(envs.into_iter().next().unwrap()), None);
+                }
+                if envs.len() > 1 {
+                    let names: Vec<_> = envs.iter()
+                        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                        .collect();
+                    return (None, Some(format!(
+                        "У ~/.umod/ знайдено кілька .env файлів: {}. Вкажіть вручну.",
+                        names.join(", ")
+                    )));
                 }
             }
         }
-        None
+        (None, Some("Credential-файл не знайдено (~/.umod/*.env)".to_string()))
     }
 
     /// Шукає umod-token-proxy скрипт.
-    ///   1. $UMOD_PROXY_BIN
-    ///   2. ~/Desktop/umod-codex-client/bin/umod-token-proxy
-    ///   3. Поруч з exe (./bin/umod-token-proxy)
     pub fn find_proxy_script() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("UMOD_PROXY_BIN") {
             let pb = PathBuf::from(&p);
@@ -92,7 +116,6 @@ impl ProxyState {
                 return Some(c.clone());
             }
         }
-        // Поруч з exe
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let local = dir.join("bin").join("umod-token-proxy");
@@ -107,10 +130,7 @@ impl ProxyState {
     /// Шукає Python виконувач.
     pub fn find_python() -> Option<PathBuf> {
         for name in &["python", "python3", "py"] {
-            if let Ok(output) = Command::new("where")
-                .arg(name)
-                .output()
-            {
+            if let Ok(output) = Command::new("where").arg(name).output() {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Some(first) = stdout.lines().next() {
@@ -126,13 +146,12 @@ impl ProxyState {
     }
 
     /// Запускає проксі у фоновому процесі.
-    /// Повертає Ok(()) якщо проксі піднявся, Err(message) — якщо ні.
     pub fn start(&mut self) -> Result<(), String> {
         if self.is_listening() {
             return Ok(());
         }
 
-        let cred = self.cred_path.clone().or_else(Self::find_credential)
+        let cred = self.cred_path.clone().or_else(|| Self::find_credential().0)
             .ok_or_else(|| "Credential-файл не знайдено (~/.umod/*.env)".to_string())?;
         self.cred_path = Some(cred.clone());
 
@@ -141,7 +160,6 @@ impl ProxyState {
         let python = Self::find_python()
             .ok_or_else(|| "Python не знайдено на PATH".to_string())?;
 
-        // Лог проксі — у TEMP
         let log_dir = std::env::temp_dir();
         let log_out = log_dir.join("umod-proxy.log");
         let log_err = log_dir.join("umod-proxy.err");
@@ -165,7 +183,6 @@ impl ProxyState {
 
         self.child = Some(child);
 
-        // Чекаємо поки проксі почне слухати (до 20с)
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(20) {
             if self.is_listening() {
