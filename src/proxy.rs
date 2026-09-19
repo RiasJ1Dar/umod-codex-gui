@@ -63,6 +63,7 @@ impl ProxyState {
     ///   1. $UMOD_CRED
     ///   2. ~/.umod/credential.env
     ///   3. ~/.umod/*.env (якщо рівно один)
+    ///
     /// Повертає (path, warning) — warning якщо файлів >1
     pub fn find_credential() -> (Option<PathBuf>, Option<String>) {
         if let Ok(p) = std::env::var("UMOD_CRED") {
